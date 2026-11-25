@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod cleanup;
 pub(crate) mod commit;
 pub(crate) mod exec;
 pub(crate) mod project;

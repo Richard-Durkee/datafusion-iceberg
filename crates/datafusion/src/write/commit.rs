@@ -37,10 +37,14 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::Catalog;
-use iceberg::spec::{DataFile, read_data_files_from_avro};
+use iceberg::spec::{
+    DataFile, FormatVersion, SchemaRef as IcebergSchemaRef, StructType,
+    read_data_files_from_avro,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
+use super::cleanup::delete_data_files;
 use super::exec::DATA_FILES_COL_NAME;
 use crate::to_datafusion_error;
 
@@ -60,6 +64,48 @@ pub struct IcebergCommitExec {
 }
 
 impl IcebergCommitExec {
+    /// Decodes the data files reported by one batch of the write exec.
+    fn read_data_files(
+        batch: &RecordBatch,
+        current_schema: &IcebergSchemaRef,
+        spec_id: i32,
+        partition_type: &StructType,
+        format_version: FormatVersion,
+    ) -> Result<Vec<DataFile>> {
+        let files_array = batch
+            .column_by_name(DATA_FILES_COL_NAME)
+            .ok_or_else(|| {
+                internal_datafusion_err!("Expected 'data_files' column in input batch")
+            })?
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| {
+                internal_datafusion_err!(
+                    "Expected 'data_files' column to be LargeBinaryArray"
+                )
+            })?;
+
+        // Each value is a separate Avro container with one or more data files.
+        let mut data_files = vec![];
+        for payload in files_array.iter() {
+            let mut payload = payload
+                .ok_or_else(|| internal_datafusion_err!("Null Avro data file payload"))?;
+            if payload.is_empty() {
+                return internal_err!("Empty Avro data file payload");
+            }
+            let files = read_data_files_from_avro(
+                &mut payload,
+                current_schema,
+                spec_id,
+                partition_type,
+                format_version,
+            )
+            .map_err(to_datafusion_error)?;
+            data_files.extend(files);
+        }
+        Ok(data_files)
+    }
+
     /// Commits the data files `input` produces to `table` through `catalog`.
     ///
     /// `input` must have a single partition, such as a
@@ -248,49 +294,43 @@ impl ExecutionPlan for IcebergCommitExec {
             let mut data_files: Vec<DataFile> = Vec::new();
             let mut total_record_count: u64 = 0;
 
-            // Execute and collect results from the input coalesced plan
+            // Execute and collect results from the input coalesced plan.
+            //
+            // After an error, keep reading: the partitions that finished still
+            // report the files they wrote, and those must be deleted because
+            // they will not be committed.
             let mut batch_stream = input_plan.execute(0, context)?;
+            let mut first_error = None;
 
             while let Some(batch_result) = batch_stream.next().await {
-                let batch = batch_result?;
-
-                let files_array = batch
-                    .column_by_name(DATA_FILES_COL_NAME)
-                    .ok_or_else(|| {
-                        internal_datafusion_err!(
-                            "Expected 'data_files' column in input batch"
-                        )
-                    })?
-                    .as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .ok_or_else(|| {
-                        internal_datafusion_err!(
-                            "Expected 'data_files' column to be LargeBinaryArray"
-                        )
-                    })?;
-
-                // Each value is a separate Avro container with one or more data files.
-                files_array.iter().try_for_each(|payload| {
-                    let mut payload = payload.ok_or_else(|| {
-                        internal_datafusion_err!("Null Avro data file payload")
-                    })?;
-                    if payload.is_empty() {
-                        return internal_err!("Empty Avro data file payload");
-                    }
-                    let files = read_data_files_from_avro(
-                        &mut payload,
+                let files = batch_result.and_then(|batch| {
+                    Self::read_data_files(
+                        &batch,
                         &current_schema,
                         spec_id,
                         &partition_type,
                         format_version,
                     )
-                    .map_err(to_datafusion_error)?;
+                });
+                match files {
+                    Ok(files) => {
+                        total_record_count +=
+                            files.iter().map(|f| f.record_count()).sum::<u64>();
+                        data_files.extend(files);
+                    }
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                }
+            }
 
-                    total_record_count +=
-                        files.iter().map(|f| f.record_count()).sum::<u64>();
-                    data_files.extend(files);
-                    Ok(())
-                })?;
+            if let Some(e) = first_error {
+                let paths = data_files
+                    .iter()
+                    .map(|f| f.file_path().to_string())
+                    .collect();
+                delete_data_files(table.file_io(), paths).await;
+                return Err(e);
             }
 
             // If no data files were collected, return a single row with count = 0

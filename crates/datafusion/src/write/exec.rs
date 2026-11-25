@@ -49,6 +49,7 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use uuid::Uuid;
 
+use super::cleanup::TrackingLocationGenerator;
 use super::task_writer::TaskWriter;
 use crate::to_datafusion_error;
 
@@ -277,8 +278,11 @@ impl ExecutionPlan for IcebergWriteExec {
 
         let file_io = self.table.file_io().clone();
         // todo location_gen and file_name_gen should be configurable
-        let location_generator = DefaultLocationGenerator::new(self.table.metadata())
-            .map_err(to_datafusion_error)?;
+        let location_generator = TrackingLocationGenerator::new(
+            DefaultLocationGenerator::new(self.table.metadata())
+                .map_err(to_datafusion_error)?,
+        );
+        let cleanup = location_generator.cleanup_guard(file_io.clone());
         // todo filename prefix/suffix should be configurable
         let file_name_generator =
             DefaultFileNameGenerator::new(Uuid::now_v7().to_string(), None, file_format);
@@ -314,17 +318,32 @@ impl ExecutionPlan for IcebergWriteExec {
 
         // Create write stream
         let stream = futures::stream::once(async move {
-            let mut task_writer = task_writer;
-            let mut input_stream = data;
+            let written = async move {
+                let mut task_writer = task_writer;
+                let mut input_stream = data;
 
-            while let Some(batch) = input_stream.next().await {
-                let batch = batch?;
-                task_writer.write(batch).await?;
+                while let Some(batch) = input_stream.next().await {
+                    let batch = batch?;
+                    task_writer.write(batch).await?;
+                }
+
+                let data_files = task_writer.close().await?;
+                Self::make_result_batch(data_files, &partition_type, format_version)
             }
+            .await;
 
-            let data_files = task_writer.close().await?;
-
-            Self::make_result_batch(data_files, &partition_type, format_version)
+            // On failure the writer has been dropped, so delete the files it
+            // created. On success the commit is now responsible for them.
+            match written {
+                Ok(batch) => {
+                    cleanup.disarm();
+                    Ok(batch)
+                }
+                Err(e) => {
+                    cleanup.delete().await;
+                    Err(e)
+                }
+            }
         })
         .boxed();
 
